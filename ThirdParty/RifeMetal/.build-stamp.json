@@ -1,0 +1,75 @@
+{
+  "dependencies": {
+    "rife-metal": {
+      "archive": "ac6408022eb6bc1a53181f5b2716a9f5ded507c2.tar.gz",
+      "commit": "ac6408022eb6bc1a53181f5b2716a9f5ded507c2",
+      "patches": [
+        {
+          "path": "ThirdParty/rife-metal/stream-io.patch",
+          "sha256": "266892943b1369b1af95ef2306bee126473a4d5ec35186628e11fb4b12a030b4"
+        },
+        {
+          "path": "ThirdParty/rife-metal/experiment-options.patch",
+          "sha256": "aa6821a05979aef45aee1980809c6304fe48251624b4c740367a6245d457d483"
+        },
+        {
+          "path": "ThirdParty/rife-metal/runtime-support.patch",
+          "sha256": "c5787366442ae31760d06425193ac48dae17d0eedca0e61df03e2536f69d354e"
+        }
+      ],
+      "sha256": "f916255f1344bca52b92c9e3e6ba23a31b7261579e87b1ac9537536a089cd3b7",
+      "source_dir": "rife-metal-ac6408022eb6bc1a53181f5b2716a9f5ded507c2",
+      "url": "https://codeload.github.com/cinemore/rife-metal/tar.gz/ac6408022eb6bc1a53181f5b2716a9f5ded507c2",
+      "version": "0.1.8",
+      "weight_sha256": "ef29a643a76a9202600458a23dddce16919337ef01743d0fbe817684ec990f74"
+    }
+  },
+  "dependency_lock_sha256": "b077186909e09ee729dc3e7cad74fb01f5d279530fd902bcc9cd906d870c09b5",
+  "dependency_stamps": {},
+  "inputs": {
+    "Scripts/derive_fourstage_model.py": "e2acd4342cc68bec08a49578e7493c3799d886c938562dc70d598f56c9e9e39a",
+    "Scripts/lib/build_common.sh": "7d3e600c98d6476cace59e01c899f60af13a9bf32d96a451eeb0d9808e9e7652",
+    "Scripts/lib/deps_lock.py": "9c6feb03396e7ae0ea8f8f1315fe879d05c39e9b5de964a8ba6f4c7a0df443ac",
+    "Scripts/prepare_rife_runtime.sh": "58244faf4b7c529f2e4b68cb19f8276e79de5950ce85e633860aa7a62f07d344",
+    "ThirdParty/rife-metal/LICENSE": "af36c0f04ed111f6b4b748101fa5e7f41b0dfad00826adcc6fa20dd8b790b7a2",
+    "ThirdParty/rife-metal/Package.swift": "8a2cbc6f12e8ff0030e6d7dbebb0b5ecbdb0f5eaefd09419c205d3661b4fe1e5",
+    "ThirdParty/rife-metal/PaddedFrameConvert.metal": "ca5edd81ca8f1e1db68b70f75ca26f1fe5fe0d5e6558b3feb86430a8dbeb9f94",
+    "ThirdParty/rife-metal/PaddedFrameConvert.swift": "602b0a40c3bfec4209d0b9180b3c2eb90b797ae5e41331d961955965337122d6",
+    "ThirdParty/rife-metal/RifeExperimentOptions.swift": "8fb625afc48dd74418cd7cafae12cd65b6be0777ce175dfb48bc52d660178769",
+    "ThirdParty/rife-metal/StudentGraphContract.swift": "e080715898c22ae629a800ccc30e90fba8bbbac526245589322289a36c60d4a1",
+    "ThirdParty/rife-metal/THIRD-PARTY.md": "9de3d613919c2c15734601a3c73816b6a898adf6df221361cfe80865b907311d",
+    "ThirdParty/rife-metal/experiment-options.patch": "aa6821a05979aef45aee1980809c6304fe48251624b4c740367a6245d457d483",
+    "ThirdParty/rife-metal/production-model.json": "8aba8b9b3606e457410f0fbc7bc5be5874aeed2a5a5c156fae4d5ae9e2d0231e",
+    "ThirdParty/rife-metal/runtime-support.patch": "c5787366442ae31760d06425193ac48dae17d0eedca0e61df03e2536f69d354e",
+    "ThirdParty/rife-metal/stream-io.patch": "266892943b1369b1af95ef2306bee126473a4d5ec35186628e11fb4b12a030b4"
+  },
+  "parameters": {
+    "mode": "source-only-library"
+  },
+  "recipe_sha256": "efc7fe289794e0353f9320a22f0ce7d2d50d95c308dd73dc2eb4f0e25f5cb9c7",
+  "schema": 1,
+  "target": {
+    "arch": "arm64",
+    "macos_min": "14.0",
+    "source_date_epoch": 1767225600
+  },
+  "toolchain": {
+    "host_machine": "arm64",
+    "macosx_deployment_target": "",
+    "sdkroot": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+    "tools": {
+      "patch": {
+        "path": "/usr/bin/patch",
+        "version": "patch 2.0-12u11-Apple"
+      },
+      "python3": {
+        "path": "/usr/bin/python3",
+        "version": "Python 3.9.6"
+      },
+      "tar": {
+        "path": "/usr/bin/bsdtar",
+        "version": "bsdtar 3.5.3 - libarchive 3.7.4 zlib/1.2.12 liblzma/5.4.3 bz2lib/1.0.8"
+      }
+    }
+  }
+}
