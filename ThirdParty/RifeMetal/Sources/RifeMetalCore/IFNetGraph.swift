@@ -29,10 +29,11 @@ public final class IFNetGraph {
     private let internalScale: Double
     private let scaleList: [Int]
     private let experimentOptions: RifeExperimentOptions
-    // Fast and Balanced can crop at the final GPU writer; empty-stage models retain the full-size fallback.
-    package var supportsCroppedOutput: Bool { experimentOptions.gpuIO && (internalScale == 0.25 || internalScale == 0.5) && !scaleList.isEmpty }
+    // All sub-resolution tiers (< 1.0: fast 1/4, medium 1/3, balanced 1/2) crop directly in the final GPU writer.
+    package var supportsCroppedOutput: Bool { experimentOptions.gpuIO && internalScale < 1.0 && !scaleList.isEmpty }
     package var usesDirectCroppedReturn: Bool { supportsCroppedOutput }
     package var supportsGPUInputPadding: Bool { experimentOptions.gpuIO }
+    package var supportsDirectSourceTextures: Bool { internalScale != 1.0 && experimentOptions.edgeGuidedUpsample }
     private let paddedFrameConvert: PaddedFrameConvert?
     private let textureCache: CVMetalTextureCache
 
@@ -906,6 +907,9 @@ public final class IFNetGraph {
     /// Writes results into caller-provided buffers. No IFBlock stages run.
     /// Single MTLCommandBuffer, committed once + waitUntilCompleted.
     public func encodeFrame(frame:         CVPixelBuffer,
+                            nv12Source:    CVPixelBuffer? = nil,
+                            casStrength:   Float = 0.0,
+                            skipFullResBuffer: Bool = false,
                             featBufOut:    MTLBuffer,
                             imgIntBufOut:  MTLBuffer,
                             imgFullBufOut: MTLBuffer) throws {
@@ -917,6 +921,9 @@ public final class IFNetGraph {
 
         let frameTex = try PixelBufferConvert.makeTexture(
             from: frame, textureCache: textureCache)
+        let nv12Texs = try nv12Source.map {
+            try PixelBufferConvert.makeNV12Textures(from: $0, textureCache: textureCache)
+        }
 
         guard let cb = queue.makeCommandBuffer() else {
             throw IFNetError.commandBufferFailed("makeCommandBuffer failed")
@@ -937,8 +944,25 @@ public final class IFNetGraph {
             enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
         }
 
-        // 1. Full-res BGRA → RGB packed buffer.
-        do {
+        // 0. Optional fused zero-copy NV12 -> BGRA8 conversion on the same command buffer.
+        if let nv12Texs {
+            guard let enc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
+                throw IFNetError.commandBufferFailed("encodeFrame NV12→BGRA: makeComputeCommandEncoder failed")
+            }
+            enc.setComputePipelineState(conv.nv12ToBGRA)
+            enc.setTexture(nv12Texs.y, index: 0)
+            enc.setTexture(nv12Texs.uv, index: 1)
+            enc.setTexture(frameTex, index: 2)
+            var fullFlag: UInt32 = nv12Texs.fullRange ? 1 : 0
+            var casVal: Float = casStrength
+            enc.setBytes(&fullFlag, length: MemoryLayout<UInt32>.size, index: 0)
+            enc.setBytes(&casVal, length: MemoryLayout<Float>.size, index: 1)
+            dispatch2D(enc, conv.nv12ToBGRA, gridW: frameTex.width, gridH: frameTex.height)
+            enc.endEncoding()
+        }
+
+        // 1. Full-res BGRA → RGB packed buffer (skipped when direct source textures feed edgeGuidedWarpBlendCropped).
+        if !skipFullResBuffer {
             guard let enc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
                 throw IFNetError.commandBufferFailed("encodeFrame BGRA→RGB: makeComputeCommandEncoder failed")
             }
@@ -985,6 +1009,7 @@ public final class IFNetGraph {
 
         airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
         airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
+        CVMetalTextureCacheFlush(textureCache, 0)
     }
 
     // MARK: - Stream inference
@@ -995,6 +1020,10 @@ public final class IFNetGraph {
     /// writing to curr*Buf. All 5 IFBlock stages, final warp+blend, and BGRA
     /// writeout proceed normally. Single MTLCommandBuffer, committed once.
     public func runStream(curr:           CVPixelBuffer,
+                          nv12Curr:       CVPixelBuffer? = nil,
+                          casStrength:    Float = 0.0,
+                          prevFrame:      CVPixelBuffer? = nil,
+                          protectStill:   Bool = false,
                           prevFeatBuf:    MTLBuffer, currFeatBuf:    MTLBuffer,
                           prevImgIntBuf:  MTLBuffer, currImgIntBuf:  MTLBuffer,
                           prevImgFullBuf: MTLBuffer, currImgFullBuf: MTLBuffer,
@@ -1034,9 +1063,15 @@ public final class IFNetGraph {
         let intW = internalWidth
         let intH = internalHeight
 
-        // 1. Pixel-buffer-backed MTLTextures for curr input only.
-        //    Outputs are bound per-timestep inside the multi-output loop.
+        // 1. Pixel-buffer-backed MTLTextures for curr (and optional prev + NV12 planes).
         let currTex = try PixelBufferConvert.makeTexture(from: curr, textureCache: textureCache)
+        let nv12Texs = try nv12Curr.map {
+            try PixelBufferConvert.makeNV12Textures(from: $0, textureCache: textureCache)
+        }
+        let prevDirectTex: MTLTexture? = try prevFrame.map {
+            try PixelBufferConvert.makeTexture(from: $0, textureCache: textureCache)
+        }
+        let skipFullResCopies = useInternalScale && experimentOptions.edgeGuidedUpsample && (prevDirectTex != nil)
 
         // 2. Tensor data wrappers.
         let flowShape:    [NSNumber] = [1, NSNumber(value: intH), NSNumber(value: intW), 4]
@@ -1092,9 +1127,26 @@ public final class IFNetGraph {
             enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
         }
 
-        // 3a. Full-res BGRA → RGB packed buffer (curr only; prev was written by a prior call) +
-        //     expand BOTH prev and curr full-res RGB buffers to RGBA textures (warp source).
-        do {
+        // 3.0. Optional fused zero-copy NV12 → BGRA8 conversion on the same command buffer.
+        if let nv12Texs {
+            guard let enc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
+                throw IFNetError.commandBufferFailed("NV12 convert: makeComputeCommandEncoder failed")
+            }
+            enc.setComputePipelineState(conv.nv12ToBGRA)
+            enc.setTexture(nv12Texs.y, index: 0)
+            enc.setTexture(nv12Texs.uv, index: 1)
+            enc.setTexture(currTex, index: 2)
+            var fullFlag: UInt32 = nv12Texs.fullRange ? 1 : 0
+            var casVal: Float = casStrength
+            enc.setBytes(&fullFlag, length: MemoryLayout<UInt32>.size, index: 0)
+            enc.setBytes(&casVal, length: MemoryLayout<Float>.size, index: 1)
+            dispatch2D(enc, conv.nv12ToBGRA, gridW: currTex.width, gridH: currTex.height)
+            enc.endEncoding()
+        }
+
+        // 3a. Full-res BGRA → RGB packed buffer + RGBA16F texture expansion:
+        //     Skipped completely when edgeGuidedWarpBlendCropped samples zero-copy BGRA8 IOSurfaces directly (-337 MB/frame at 4K).
+        if !skipFullResCopies {
             guard let enc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
                 throw IFNetError.commandBufferFailed("input convert: makeComputeCommandEncoder failed")
             }
@@ -1435,57 +1487,75 @@ public final class IFNetGraph {
             guard let finalEnc = mpsCB.commandBuffer.makeComputeCommandEncoder() else {
                 throw IFNetError.commandBufferFailed("final warp encoder failed")
             }
-            if useInternalScale {
-                finalEnc.setComputePipelineState(conv.flowUpsampleSplit)
+            if useInternalScale && experimentOptions.edgeGuidedUpsample {
+                finalEnc.setComputePipelineState(conv.edgeGuidedWarpBlendCropped)
+                finalEnc.setTexture(prevDirectTex ?? p.srcTex0Full, index: 0)
+                finalEnc.setTexture(skipFullResCopies ? currTex : p.srcTex1Full, index: 1)
+                finalEnc.setTexture(outTex, index: 2)
                 finalEnc.setBuffer(finalFlowIntBuf, offset: 0, index: 0)
+                finalEnc.setBuffer(resolvedMaskBuf, offset: 0, index: 1)
                 var intDim: SIMD2<UInt32> = SIMD2(UInt32(intW), UInt32(intH))
                 var valueScale: Float = Float(1.0 / internalScale)
-                finalEnc.setBytes(&intDim, length: MemoryLayout<SIMD2<UInt32>>.size, index: 1)
-                finalEnc.setBytes(&valueScale, length: MemoryLayout<Float>.size, index: 2)
-                finalEnc.setTexture(p.finalFlowTex0, index: 0)
-                finalEnc.setTexture(p.finalFlowTex1, index: 1)
-                dispatch2D(finalEnc, conv.flowUpsampleSplit, gridW: width, gridH: height)
-            } else {
-                finalEnc.setComputePipelineState(conv.flowSplit)
-                finalEnc.setBuffer(finalFlowIntBuf, offset: 0, index: 0)
-                finalEnc.setTexture(p.finalFlowTex0, index: 0)
-                finalEnc.setTexture(p.finalFlowTex1, index: 1)
-                dispatch2D(finalEnc, conv.flowSplit, gridW: width, gridH: height)
-            }
-
-            warp.encodeToBuffer(into: finalEnc,
-                                 source: p.srcTex0Full,
-                                 flow: p.finalFlowTex0,
-                                 output: p.finalWarped0Buf,
-                                 width: width, height: height)
-            warp.encodeToBuffer(into: finalEnc,
-                                 source: p.srcTex1Full,
-                                 flow: p.finalFlowTex1,
-                                 output: p.finalWarped1Buf,
-                                 width: width, height: height)
-
-            let cropped = outTex.width != width || outTex.height != height
-            let blendMask = cropped ? conv.blendUpsampleMaskAndPackCropped : conv.blendUpsampleMaskAndPack
-            if cropped {
-                var sourceDim = SIMD2<UInt32>(UInt32(width), UInt32(height))
+                var sourceDim: SIMD2<UInt32> = SIMD2(UInt32(width), UInt32(height))
+                var protectFlag: UInt32 = (protectStill && prevDirectTex != nil) ? 1 : 0
+                finalEnc.setBytes(&intDim, length: MemoryLayout<SIMD2<UInt32>>.size, index: 2)
+                finalEnc.setBytes(&valueScale, length: MemoryLayout<Float>.size, index: 3)
                 finalEnc.setBytes(&sourceDim, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 4)
-            }
-            if useInternalScale {
-                finalEnc.setComputePipelineState(blendMask)
-                finalEnc.setBuffer(p.finalWarped0Buf, offset: 0, index: 0)
-                finalEnc.setBuffer(p.finalWarped1Buf, offset: 0, index: 1)
-                finalEnc.setBuffer(resolvedMaskBuf, offset: 0, index: 2)
-                var intDimM: SIMD2<UInt32> = SIMD2(UInt32(intW), UInt32(intH))
-                finalEnc.setBytes(&intDimM, length: MemoryLayout<SIMD2<UInt32>>.size, index: 3)
-                finalEnc.setTexture(outTex, index: 0)
-                dispatch2D(finalEnc, blendMask, gridW: outTex.width, gridH: outTex.height)
+                finalEnc.setBytes(&protectFlag, length: MemoryLayout<UInt32>.size, index: 5)
+                dispatch2D(finalEnc, conv.edgeGuidedWarpBlendCropped, gridW: outTex.width, gridH: outTex.height)
             } else {
-                finalEnc.setComputePipelineState(conv.blendAndPack)
-                finalEnc.setBuffer(p.finalWarped0Buf, offset: 0, index: 0)
-                finalEnc.setBuffer(p.finalWarped1Buf, offset: 0, index: 1)
-                finalEnc.setBuffer(resolvedMaskBuf, offset: 0, index: 2)
-                finalEnc.setTexture(outTex, index: 0)
-                dispatch2D(finalEnc, conv.blendAndPack, gridW: width, gridH: height)
+                if useInternalScale {
+                    finalEnc.setComputePipelineState(conv.flowUpsampleSplit)
+                    finalEnc.setBuffer(finalFlowIntBuf, offset: 0, index: 0)
+                    var intDim: SIMD2<UInt32> = SIMD2(UInt32(intW), UInt32(intH))
+                    var valueScale: Float = Float(1.0 / internalScale)
+                    finalEnc.setBytes(&intDim, length: MemoryLayout<SIMD2<UInt32>>.size, index: 1)
+                    finalEnc.setBytes(&valueScale, length: MemoryLayout<Float>.size, index: 2)
+                    finalEnc.setTexture(p.finalFlowTex0, index: 0)
+                    finalEnc.setTexture(p.finalFlowTex1, index: 1)
+                    dispatch2D(finalEnc, conv.flowUpsampleSplit, gridW: width, gridH: height)
+                } else {
+                    finalEnc.setComputePipelineState(conv.flowSplit)
+                    finalEnc.setBuffer(finalFlowIntBuf, offset: 0, index: 0)
+                    finalEnc.setTexture(p.finalFlowTex0, index: 0)
+                    finalEnc.setTexture(p.finalFlowTex1, index: 1)
+                    dispatch2D(finalEnc, conv.flowSplit, gridW: width, gridH: height)
+                }
+
+                warp.encodeToBuffer(into: finalEnc,
+                                     source: p.srcTex0Full,
+                                     flow: p.finalFlowTex0,
+                                     output: p.finalWarped0Buf,
+                                     width: width, height: height)
+                warp.encodeToBuffer(into: finalEnc,
+                                     source: p.srcTex1Full,
+                                     flow: p.finalFlowTex1,
+                                     output: p.finalWarped1Buf,
+                                     width: width, height: height)
+
+                let cropped = outTex.width != width || outTex.height != height
+                let blendMask = cropped ? conv.blendUpsampleMaskAndPackCropped : conv.blendUpsampleMaskAndPack
+                if cropped {
+                    var sourceDim = SIMD2<UInt32>(UInt32(width), UInt32(height))
+                    finalEnc.setBytes(&sourceDim, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 4)
+                }
+                if useInternalScale {
+                    finalEnc.setComputePipelineState(blendMask)
+                    finalEnc.setBuffer(p.finalWarped0Buf, offset: 0, index: 0)
+                    finalEnc.setBuffer(p.finalWarped1Buf, offset: 0, index: 1)
+                    finalEnc.setBuffer(resolvedMaskBuf, offset: 0, index: 2)
+                    var intDimM: SIMD2<UInt32> = SIMD2(UInt32(intW), UInt32(intH))
+                    finalEnc.setBytes(&intDimM, length: MemoryLayout<SIMD2<UInt32>>.size, index: 3)
+                    finalEnc.setTexture(outTex, index: 0)
+                    dispatch2D(finalEnc, blendMask, gridW: outTex.width, gridH: outTex.height)
+                } else {
+                    finalEnc.setComputePipelineState(conv.blendAndPack)
+                    finalEnc.setBuffer(p.finalWarped0Buf, offset: 0, index: 0)
+                    finalEnc.setBuffer(p.finalWarped1Buf, offset: 0, index: 1)
+                    finalEnc.setBuffer(resolvedMaskBuf, offset: 0, index: 2)
+                    finalEnc.setTexture(outTex, index: 0)
+                    dispatch2D(finalEnc, conv.blendAndPack, gridW: width, gridH: height)
+                }
             }
             finalEnc.endEncoding()
 
@@ -1502,6 +1572,7 @@ public final class IFNetGraph {
             airServiceTraceCommit(mpsCB, collector: context.airServiceTraceCollector)
             airServiceTraceWaitUntilCompleted(mpsCB, collector: context.airServiceTraceCollector)
         }  // end per-timestep loop
+        CVMetalTextureCacheFlush(textureCache, 0)
     }
 
     // MARK: - Per-stage debug dump (gated by RIFE_DUMP_DIR env var)

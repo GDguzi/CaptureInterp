@@ -28,6 +28,31 @@ public enum PixelBufferConvert {
         return tex
     }
 
+    /// Creates zero-copy Y (.r8Unorm) and CbCr (.rg8Unorm) MTLTexture views of an NV12 (420v/420f) CVPixelBuffer.
+    public static func makeNV12Textures(from pixelBuffer: CVPixelBuffer,
+                                        textureCache: CVMetalTextureCache) throws -> (y: MTLTexture, uv: MTLTexture, fullRange: Bool) {
+        let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        let isFull = (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        let yW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let yH = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let uvW = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1)
+        let uvH = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
+
+        var cvY: CVMetalTexture?, cvUV: CVMetalTexture?
+        let e0 = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, textureCache, pixelBuffer, nil, .r8Unorm, yW, yH, 0, &cvY)
+        let e1 = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, textureCache, pixelBuffer, nil, .rg8Unorm, uvW, uvH, 1, &cvUV)
+        guard e0 == kCVReturnSuccess, e1 == kCVReturnSuccess,
+              let cvY, let cvUV,
+              let yTex = CVMetalTextureGetTexture(cvY),
+              let uvTex = CVMetalTextureGetTexture(cvUV) else {
+            throw NSError(domain: "PixelBufferConvert", code: Int(e0 != kCVReturnSuccess ? e0 : e1),
+                          userInfo: [NSLocalizedDescriptionKey: "NV12 CVMetalTextureCacheCreateTextureFromImage failed"])
+        }
+        return (yTex, uvTex, isFull)
+    }
+
     /// Allocates an output CVPixelBuffer (BGRA8) of the given size, Metal-compatible.
     public static func makeOutputPixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
         let attrs: [String: Any] = [

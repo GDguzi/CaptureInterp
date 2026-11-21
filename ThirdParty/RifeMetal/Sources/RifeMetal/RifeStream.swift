@@ -11,6 +11,7 @@ import RifeMetalCore
 /// thread-safe — caller must serialize push/reset on a single instance.
 public final class RifeStream: @unchecked Sendable {
     private var paddedInputBuffer: CVPixelBuffer?
+    private var prevFrameBuffer: CVPixelBuffer?
 
     public let width: Int
     public let height: Int
@@ -34,6 +35,7 @@ public final class RifeStream: @unchecked Sendable {
 
     internal var prevSlot: Int = 0
     internal var hasCachedPrev: Bool = false
+    private var hasFullResPrev: Bool = false
 
     internal init(interpolator: RifeInterpolator,
                   graph: IFNetGraph,
@@ -92,7 +94,7 @@ public final class RifeStream: @unchecked Sendable {
                 paddedFrame = frame
             }
 
-            if !hasCachedPrev {
+            if !hasCachedPrev || !hasFullResPrev {
                 // First push: encode and cache; no output produced.
                 try encodeAndRotate(paddedFrame)
                 hasCachedPrev = true
@@ -190,7 +192,7 @@ public final class RifeStream: @unchecked Sendable {
                 paddedFrame = frame
             }
 
-            if !hasCachedPrev {
+            if !hasCachedPrev || !hasFullResPrev {
                 // First push: encode + cache; output left untouched.
                 try encodeAndRotate(paddedFrame)
                 hasCachedPrev = true
@@ -226,7 +228,129 @@ public final class RifeStream: @unchecked Sendable {
     /// first-frame path. Cache buffers are retained for reuse.
     public func reset() {
         hasCachedPrev = false
+        hasFullResPrev = false
         paddedInputBuffer = nil
+        prevFrameBuffer = nil
+    }
+
+    /// Fused single-command-buffer stream step for distinct pool-allocated BGRA frames (optionally populated
+    /// directly on the GPU from an NV12 capture IOSurface, and optionally running contrast-anchored subtitle/UI
+    /// protection inside the final warp+blend pass).
+    public func pushFused(nv12Source: CVPixelBuffer?,
+                          currBGRA: CVPixelBuffer,
+                          into output: CVPixelBuffer,
+                          protectStill: Bool = false,
+                          casStrength: Float = 0.0) throws -> Bool {
+        return try pushFused(nv12Source: nv12Source, currBGRA: currBGRA, timesteps: [0.5], outputs: [output], protectStill: protectStill, casStrength: casStrength)
+    }
+
+    /// Multi-timestep fused stream step (supports 1 or more intermediate frames).
+    public func pushFused(nv12Source: CVPixelBuffer?,
+                          currBGRA: CVPixelBuffer,
+                          timesteps: [Float],
+                          outputs: [CVPixelBuffer],
+                          protectStill: Bool = false,
+                          casStrength: Float = 0.0) throws -> Bool {
+        guard !timesteps.isEmpty, timesteps.count == outputs.count else {
+            throw RifeError.invalidTimesteps("timesteps/outputs mismatch")
+        }
+        for t in timesteps {
+            guard t > 0 && t < 1 else { throw RifeError.invalidTimesteps("timestep \(t) out of (0, 1)") }
+        }
+        guard CVPixelBufferGetWidth(currBGRA) == width, CVPixelBufferGetHeight(currBGRA) == height else {
+            throw RifeError.dimensionMismatch
+        }
+        guard CVPixelBufferGetPixelFormatType(currBGRA) == kCVPixelFormatType_32BGRA,
+              CVPixelBufferGetIOSurface(currBGRA) != nil else {
+            throw RifeError.unsupportedPixelFormat(CVPixelBufferGetPixelFormatType(currBGRA))
+        }
+        for o in outputs {
+            guard CVPixelBufferGetWidth(o) == width, CVPixelBufferGetHeight(o) == height else {
+                throw RifeError.dimensionMismatch
+            }
+            guard CVPixelBufferGetPixelFormatType(o) == kCVPixelFormatType_32BGRA,
+                  CVPixelBufferGetIOSurface(o) != nil else {
+                throw RifeError.unsupportedPixelFormat(CVPixelBufferGetPixelFormatType(o))
+            }
+        }
+        if let nv12Source {
+            let nf = CVPixelBufferGetPixelFormatType(nv12Source)
+            guard (nf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || nf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                  CVPixelBufferGetIOSurface(nv12Source) != nil else {
+                throw RifeError.unsupportedPixelFormat(nf)
+            }
+        }
+
+        return try queue.sync { () -> Bool in
+            do {
+                try ensureCacheAllocated()
+                let canSkipFull = graph.supportsDirectSourceTextures
+                if canSkipFull, let prev = prevFrameBuffer, prev === currBGRA {
+                    throw RifeError.inferenceFailed("currBGRA aliases cached prevFrameBuffer")
+                }
+                if !hasCachedPrev || (canSkipFull && prevFrameBuffer == nil) || (!canSkipFull && !hasFullResPrev) {
+                    let writeSlot = 1 - prevSlot
+                    try graph.encodeFrame(
+                        frame: currBGRA,
+                        nv12Source: nv12Source,
+                        casStrength: casStrength,
+                        skipFullResBuffer: canSkipFull,
+                        featBufOut:    featBuf[writeSlot],
+                        imgIntBufOut:  imgIntBuf[writeSlot],
+                        imgFullBufOut: imgFullBuf[writeSlot])
+                    prevSlot = writeSlot
+                    prevFrameBuffer = currBGRA
+                    hasCachedPrev = true
+                    hasFullResPrev = !canSkipFull
+                    return false
+                }
+
+                let prevBGRA = canSkipFull ? prevFrameBuffer : nil
+                let writeSlot = 1 - prevSlot
+                let needsPad = (paddedW != width) || (paddedH != height)
+                if needsPad && !graph.supportsCroppedOutput {
+                    var paddedOuts: [CVPixelBuffer] = []
+                    for _ in outputs {
+                        paddedOuts.append(try PixelBufferConvert.makeOutputPixelBuffer(width: paddedW, height: paddedH))
+                    }
+                    try graph.runStream(
+                        curr: currBGRA,
+                        nv12Curr: nv12Source,
+                        casStrength: casStrength,
+                        prevFrame: prevBGRA,
+                        protectStill: protectStill,
+                        prevFeatBuf:    featBuf[prevSlot],    currFeatBuf:    featBuf[writeSlot],
+                        prevImgIntBuf:  imgIntBuf[prevSlot],  currImgIntBuf:  imgIntBuf[writeSlot],
+                        prevImgFullBuf: imgFullBuf[prevSlot], currImgFullBuf: imgFullBuf[writeSlot],
+                        timesteps: timesteps,
+                        outputs:   paddedOuts)
+                    for (idx, pOut) in paddedOuts.enumerated() {
+                        try interpolator.cropPixelBufferForStream(pOut, into: outputs[idx])
+                    }
+                } else {
+                    try graph.runStream(
+                        curr: currBGRA,
+                        nv12Curr: nv12Source,
+                        casStrength: casStrength,
+                        prevFrame: prevBGRA,
+                        protectStill: protectStill,
+                        prevFeatBuf:    featBuf[prevSlot],    currFeatBuf:    featBuf[writeSlot],
+                        prevImgIntBuf:  imgIntBuf[prevSlot],  currImgIntBuf:  imgIntBuf[writeSlot],
+                        prevImgFullBuf: imgFullBuf[prevSlot], currImgFullBuf: imgFullBuf[writeSlot],
+                        timesteps: timesteps,
+                        outputs:   outputs)
+                }
+                prevSlot = writeSlot
+                prevFrameBuffer = currBGRA
+                hasFullResPrev = !canSkipFull
+                return true
+            } catch {
+                paddedInputBuffer = nil
+                prevFrameBuffer = nil
+                hasFullResPrev = false
+                throw error
+            }
+        }
     }
 
     // push 在串行队列内等待 GPU 完成，下一帧才可以覆盖这份输入。
@@ -249,6 +373,8 @@ public final class RifeStream: @unchecked Sendable {
             imgIntBufOut:  imgIntBuf[writeSlot],
             imgFullBufOut: imgFullBuf[writeSlot])
         prevSlot = writeSlot
+        hasFullResPrev = true
+        prevFrameBuffer = nil
     }
 
     /// Runs the streaming inference graph using `prevSlot` for prev bindings and
@@ -266,6 +392,8 @@ public final class RifeStream: @unchecked Sendable {
             timesteps: timesteps,
             outputs:   outputs)
         prevSlot = writeSlot
+        hasFullResPrev = true
+        prevFrameBuffer = nil
     }
 
     private func ensureCacheAllocated() throws {

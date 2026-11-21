@@ -12,9 +12,12 @@ public final class PaddedFrameConvert {
     public let pipeline: MTLComputePipelineState
 
     public init(device: MTLDevice) throws {
+        guard let resBundle = RifeResourceBundle.bundle(named: "RifeMetal_RifeMetalCore") else {
+            throw PaddedFrameConvertError.pipelineCompilationFailed("RifeMetal_RifeMetalCore.bundle not found in app resources")
+        }
         let library: MTLLibrary
         do {
-            library = try device.makeDefaultLibrary(bundle: Bundle.module)
+            library = try device.makeDefaultLibrary(bundle: resBundle)
         } catch {
             throw PaddedFrameConvertError.pipelineCompilationFailed("library load failed: \(error)")
         }

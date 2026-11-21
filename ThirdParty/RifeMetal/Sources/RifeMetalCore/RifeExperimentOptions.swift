@@ -5,9 +5,11 @@ import Foundation
 public struct RifeExperimentOptions: Sendable {
     public let gpuIO: Bool
     public let replaceMask: Bool
+    public let edgeGuidedUpsample: Bool
 
-    public init(gpuIO: Bool = true, replaceMask: Bool = false) {
+    public init(gpuIO: Bool = true, replaceMask: Bool = false, edgeGuidedUpsample: Bool = true) {
         self.gpuIO = gpuIO
         self.replaceMask = replaceMask
+        self.edgeGuidedUpsample = edgeGuidedUpsample
     }
 }

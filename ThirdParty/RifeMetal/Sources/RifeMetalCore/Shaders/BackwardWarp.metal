@@ -130,15 +130,25 @@ kernel void rifeBGRADownsampleToRGB(
 ) {
     if (gid.x >= outDim.x || gid.y >= outDim.y) return;
     constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
-    // Sample at the centre of the corresponding source region. For invScale=2, output
-    // pixel (gx, gy) maps to source coord (gx*2 + 1, gy*2 + 1) — the boundary between
-    // the two source pixels — and the linear filter averages them.
-    float2 srcCoord = (float2(gid) + float2(0.5)) * invScale;
-    half4 c = input.sample(s, srcCoord);
+    float2 center = (float2(gid) + float2(0.5f)) * invScale;
+    half3 rgb;
+    if (invScale <= 2.01f) {
+        // invScale == 2: center lands on exact 2x2 texel corner -> single bilinear tap averages all 4 pixels.
+        rgb = input.sample(s, center).rgb;
+    } else {
+        // invScale == 3 (off = 2/3) -> exact 3x3 9-pixel uniform box average in 4 bilinear taps;
+        // invScale == 4 (off = 1.0) -> exact 4x4 16-pixel uniform box average in 4 bilinear taps.
+        float off = (invScale - 1.0f) * (1.0f / 3.0f);
+        float3 acc = float3(input.sample(s, center + float2(-off, -off)).rgb)
+                   + float3(input.sample(s, center + float2( off, -off)).rgb)
+                   + float3(input.sample(s, center + float2(-off,  off)).rgb)
+                   + float3(input.sample(s, center + float2( off,  off)).rgb);
+        rgb = half3(acc * 0.25f);
+    }
     uint outIdx = (gid.y * outDim.x + gid.x) * 3;
-    output[outIdx + 0] = c.r;
-    output[outIdx + 1] = c.g;
-    output[outIdx + 2] = c.b;
+    output[outIdx + 0] = rgb.r;
+    output[outIdx + 1] = rgb.g;
+    output[outIdx + 2] = rgb.b;
 }
 
 /// Packed fp16 RGB buffer (NHWC) → BGRA8 texture (alpha=1).
@@ -421,4 +431,277 @@ kernel void rifeRGBATexToRGBBuf(
     output[outIdx + 0] = c.r;
     output[outIdx + 1] = c.g;
     output[outIdx + 2] = c.b;
+}
+
+inline float rifeBt709Luma(float3 c) {
+    return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+struct CatmullSample {
+    float3 cr;
+    float3 lin;
+    float3 lo;
+    float3 hi;
+};
+
+/// 5-bilinear-tap Catmull-Rom bicubic sampler with strict local 2x2 neighborhood min/max anti-ringing clamp.
+/// Preserves sub-pixel 4K micro-texture during motion warps with zero white/black overshoot halos.
+inline CatmullSample sampleCatmullRom5Tap(
+    texture2d<half, access::sample> tex,
+    sampler linSampler,
+    float2 coord
+) {
+    int texW = int(tex.get_width()), texH = int(tex.get_height());
+    if (!isfinite(coord.x) || !isfinite(coord.y)) {
+        coord = float2(0.5f, 0.5f);
+    }
+    float2 samplePos = coord - 0.5f;
+    float2 texPos1 = floor(samplePos);
+    float2 f = samplePos - texPos1;
+
+    float2 w0 = f * (-0.5f + f * (1.0f - 0.5f * f));
+    float2 w1 = 1.0f + f * f * (-2.5f + 1.5f * f);
+    float2 w2 = f * (0.5f + f * (2.0f - 1.5f * f));
+    float2 w3 = f * f * (-0.5f + 0.5f * f);
+
+    float2 w12 = w1 + w2;
+    float2 offset12 = w2 / w12;
+
+    float2 tc0  = texPos1 - 0.5f;
+    float2 tc3  = texPos1 + 2.5f;
+    float2 tc12 = texPos1 + 0.5f + offset12;
+
+    float cw12    = w12.x * w12.y;
+    float cwTop   = w12.x * w0.y;
+    float cwLeft  = w0.x  * w12.y;
+    float cwRight = w3.x  * w12.y;
+    float cwBot   = w12.x * w3.y;
+    float wSum    = cw12 + cwTop + cwLeft + cwRight + cwBot;
+
+    float3 cMid   = float3(tex.sample(linSampler, tc12).rgb);
+    float3 cTop   = float3(tex.sample(linSampler, float2(tc12.x, tc0.y)).rgb);
+    float3 cLeft  = float3(tex.sample(linSampler, float2(tc0.x, tc12.y)).rgb);
+    float3 cRight = float3(tex.sample(linSampler, float2(tc3.x, tc12.y)).rgb);
+    float3 cBot   = float3(tex.sample(linSampler, float2(tc12.x, tc3.y)).rgb);
+    float3 crRaw  = (cMid * cw12 + cTop * cwTop + cLeft * cwLeft + cRight * cwRight + cBot * cwBot) / wSum;
+
+    int x0 = clamp(int(texPos1.x),     0, texW - 1);
+    int x1 = clamp(int(texPos1.x) + 1, 0, texW - 1);
+    int y0 = clamp(int(texPos1.y),     0, texH - 1);
+    int y1 = clamp(int(texPos1.y) + 1, 0, texH - 1);
+
+    float3 p00 = float3(tex.read(uint2(uint(x0), uint(y0))).rgb);
+    float3 p10 = float3(tex.read(uint2(uint(x1), uint(y0))).rgb);
+    float3 p01 = float3(tex.read(uint2(uint(x0), uint(y1))).rgb);
+    float3 p11 = float3(tex.read(uint2(uint(x1), uint(y1))).rgb);
+
+    float3 lo = min(min(p00, p10), min(p01, p11));
+    float3 hi = max(max(p00, p10), max(p01, p11));
+    float3 lin = mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);
+
+    CatmullSample out;
+    out.cr  = clamp(crRaw, lo, hi);
+    out.lin = lin;
+    out.lo  = lo;
+    out.hi  = hi;
+    return out;
+}
+
+/// Single-pass fused 2x2 edge-guided flow/mask upsample + backward warp + blend + optional UI/subtitle
+/// still-pixel protection + cropped BGRA writeout.
+kernel void rifeEdgeGuidedWarpBlendCropped(
+    texture2d<half, access::sample> src0          [[texture(0)]],
+    texture2d<half, access::sample> src1          [[texture(1)]],
+    device const half *flowInternal               [[buffer(0)]],
+    device const half *maskInternal               [[buffer(1)]],
+    constant uint2 &internalDim                   [[buffer(2)]],
+    constant float &valueScale                    [[buffer(3)]],
+    constant uint2 &sourceDim                     [[buffer(4)]],
+    constant uint  &protectStillFlag              [[buffer(5)]],
+    texture2d<half, access::write> output         [[texture(2)]],
+    uint2 gid                                     [[thread_position_in_grid]]
+) {
+    uint outW = output.get_width(), outH = output.get_height();
+    if (gid.x >= outW || gid.y >= outH) return;
+
+    float stillBlend = 0.0f;
+    half3 curExact = half3(0.0h);
+    if (protectStillFlag != 0u && src0.get_width() >= outW && src0.get_height() >= outH &&
+        src1.get_width() >= outW && src1.get_height() >= outH) {
+        const float tol = 3.5f / 255.0f;
+        float3 curC = float3(src1.read(gid).rgb);
+        float3 d0 = abs(float3(src0.read(gid).rgb) - curC);
+        if (max(d0.r, max(d0.g, d0.b)) <= tol) {
+            int w = int(outW), h = int(outH);
+            int stillCount = 0;
+            float minY = 1.0f, maxY = 0.0f;
+            for (int dy = -1; dy <= 1; dy++) {
+                uint py = uint(clamp(int(gid.y) + dy, 0, h - 1));
+                for (int dx = -2; dx <= 2; dx++) {
+                    uint2 p = uint2(uint(clamp(int(gid.x) + dx, 0, w - 1)), py);
+                    float3 cp = float3(src1.read(p).rgb);
+                    float3 dp = abs(float3(src0.read(p).rgb) - cp);
+                    if (max(dp.r, max(dp.g, dp.b)) <= tol) stillCount++;
+                    float y = rifeBt709Luma(cp);
+                    minY = min(minY, y);
+                    maxY = max(maxY, y);
+                }
+            }
+            if (stillCount >= 13) {
+                const int2 arms[4] = { int2(-5, 0), int2(5, 0), int2(0, -5), int2(0, 5) };
+                for (int k = 0; k < 4; k++) {
+                    uint2 p = uint2(uint(clamp(int(gid.x) + arms[k].x, 0, w - 1)),
+                                    uint(clamp(int(gid.y) + arms[k].y, 0, h - 1)));
+                    float y = rifeBt709Luma(float3(src1.read(p).rgb));
+                    minY = min(minY, y);
+                    maxY = max(maxY, y);
+                }
+                float contrast = maxY - minY;
+                if (contrast >= (28.0f / 255.0f)) {
+                    stillBlend = clamp((contrast - 28.0f / 255.0f) / (20.0f / 255.0f), 0.0f, 1.0f);
+                    curExact = half3(curC);
+                    if (stillBlend >= 0.999f) {
+                        output.write(half4(curExact, 1.0h), gid);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
+    uint W = sourceDim.x, H = sourceDim.y;
+    int iW = int(internalDim.x), iH = int(internalDim.y);
+
+    float u = (float(gid.x) + 0.5f) * float(iW) / float(W) - 0.5f;
+    float v = (float(gid.y) + 0.5f) * float(iH) / float(H) - 0.5f;
+    int u0 = int(floor(u)), v0 = int(floor(v));
+    float du = u - float(u0), dv = v - float(v0);
+    int u1 = min(u0 + 1, iW - 1), v1 = min(v0 + 1, iH - 1);
+    u0 = max(u0, 0); v0 = max(v0, 0);
+
+    uint idx00 = uint(v0 * iW + u0), idx01 = uint(v0 * iW + u1);
+    uint idx10 = uint(v1 * iW + u0), idx11 = uint(v1 * iW + u1);
+    uint b00 = idx00 * 4u, b01 = idx01 * 4u, b10 = idx10 * 4u, b11 = idx11 * 4u;
+
+    float4 f00 = float4(float(flowInternal[b00+0]), float(flowInternal[b00+1]), float(flowInternal[b00+2]), float(flowInternal[b00+3])) * valueScale;
+    float4 f01 = float4(float(flowInternal[b01+0]), float(flowInternal[b01+1]), float(flowInternal[b01+2]), float(flowInternal[b01+3])) * valueScale;
+    float4 f10 = float4(float(flowInternal[b10+0]), float(flowInternal[b10+1]), float(flowInternal[b10+2]), float(flowInternal[b10+3])) * valueScale;
+    float4 f11 = float4(float(flowInternal[b11+0]), float(flowInternal[b11+1]), float(flowInternal[b11+2]), float(flowInternal[b11+3])) * valueScale;
+
+    float m00 = float(maskInternal[idx00]), m01 = float(maskInternal[idx01]);
+    float m10 = float(maskInternal[idx10]), m11 = float(maskInternal[idx11]);
+
+    float sw00 = (1.0f - du) * (1.0f - dv), sw01 = du * (1.0f - dv);
+    float sw10 = (1.0f - du) * dv,          sw11 = du * dv;
+
+    float4 fFinal = f00 * sw00 + f01 * sw01 + f10 * sw10 + f11 * sw11;
+    float  mFinal = m00 * sw00 + m01 * sw01 + m10 * sw10 + m11 * sw11;
+
+    float2 center = float2(gid) + float2(0.5f, 0.5f);
+
+    float4 dDiagA = abs(f00 - f11), dDiagB = abs(f01 - f10);
+    float spread = max(max(dDiagA.x + dDiagA.y, dDiagA.z + dDiagA.w),
+                       max(dDiagB.x + dDiagB.y, dDiagB.z + dDiagB.w));
+
+    if (spread >= 3.0f) {
+        float4 candsF[4] = { f00, f01, f10, f11 };
+        float  candsM[4] = { m00, m01, m10, m11 };
+        float  spatW[4]  = { sw00 + 0.04f, sw01 + 0.04f, sw10 + 0.04f, sw11 + 0.04f };
+        float  photoErr[4];
+        float  minErr = 1e9f;
+        for (int k = 0; k < 4; k++) {
+            half3 c0 = src0.sample(s, center + candsF[k].xy).rgb;
+            half3 c1 = src1.sample(s, center + candsF[k].zw).rgb;
+            float e = float(abs(c0.r - c1.r) + abs(c0.g - c1.g) + abs(c0.b - c1.b));
+            photoErr[k] = e;
+            minErr = min(minErr, e);
+        }
+        float sumW = 0.0f;
+        float4 accF = float4(0.0f);
+        float  accM = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            float pw = exp(-clamp((photoErr[k] - minErr) * 14.0f, 0.0f, 12.0f));
+            float w = spatW[k] * pw;
+            accF += candsF[k] * w;
+            accM += candsM[k] * w;
+            sumW += w;
+        }
+        if (sumW > 1e-6f) {
+            fFinal = accF / sumW;
+            mFinal = accM / sumW;
+        }
+    }
+
+    CatmullSample s0 = sampleCatmullRom5Tap(src0, s, center + fFinal.xy);
+    CatmullSample s1 = sampleCatmullRom5Tap(src1, s, center + fFinal.zw);
+    float m = 1.0f / (1.0f + exp(-mFinal));
+    float3 blendedF = s0.cr * m + s1.cr * (1.0f - m);
+
+    // Recover fine micro-texture when sub-pixel flow phase difference partially cancels grass/brick ripples
+    float3 hf0 = s0.cr - s0.lin;
+    float3 hf1 = s1.cr - s1.lin;
+    if (dot(hf0, hf1) < 0.0f) {
+        float3 hfPick = (dot(hf0, hf0) >= dot(hf1, hf1)) ? hf0 : hf1;
+        blendedF = clamp(blendedF + hfPick * 0.45f, min(s0.lo, s1.lo), max(s0.hi, s1.hi));
+    }
+
+    half3 blended = half3(blendedF);
+    if (stillBlend > 0.0f) {
+        blended = mix(blended, curExact, half(stillBlend));
+    }
+    output.write(half4(blended.r, blended.g, blended.b, 1.0h), gid);
+}
+
+inline float nv12NormY(float yRaw, uint fullRange) {
+    return (fullRange != 0u) ? yRaw : clamp(yRaw * (255.0f / 219.0f) - (16.0f / 219.0f), 0.0f, 1.0f);
+}
+
+/// Zero-copy NV12 (bi-planar 8-bit 4:2:0, ITU-R BT.709 video-range or full-range, Left chroma siting)
+/// to BGRA8 texture conversion + optional Contrast-Adaptive Sharpening (CAS) for 4K->5K panel scaling.
+kernel void rifeNV12ToBGRA(
+    texture2d<float, access::read>   yTex       [[texture(0)]],
+    texture2d<float, access::sample> uvTex      [[texture(1)]],
+    texture2d<half,  access::write>  outBGRA    [[texture(2)]],
+    constant uint  &fullRange                   [[buffer(0)]],
+    constant float &casStrength                 [[buffer(1)]],
+    uint2 gid                                   [[thread_position_in_grid]]
+) {
+    uint W = outBGRA.get_width(), H = outBGRA.get_height();
+    if (gid.x >= W || gid.y >= H) return;
+
+    constexpr sampler chromaSampler(coord::pixel, address::clamp_to_edge, filter::linear);
+    // MPEG-2 / H.264 / BT.709 4:2:0 Left chroma siting: horizontally co-sited at even x, vertically centered
+    float2 uvCoord = float2(0.5f * float(gid.x) + 0.5f, 0.5f * float(gid.y) + 0.25f);
+    float y = nv12NormY(yTex.read(gid).r, fullRange);
+
+    if (casStrength > 0.001f) {
+        float yN  = nv12NormY(yTex.read(uint2(gid.x, max(gid.y, 1u) - 1u)).r, fullRange);
+        float yS  = nv12NormY(yTex.read(uint2(gid.x, min(gid.y + 1u, H - 1u))).r, fullRange);
+        float yW  = nv12NormY(yTex.read(uint2(max(gid.x, 1u) - 1u, gid.y)).r, fullRange);
+        float yEa = nv12NormY(yTex.read(uint2(min(gid.x + 1u, W - 1u), gid.y)).r, fullRange);
+        float mnY = min(y, min(min(yN, yS), min(yW, yEa)));
+        float mxY = max(y, max(max(yN, yS), max(yW, yEa)));
+        float amp = sqrt(clamp(min(mnY, 1.0f - mxY) / max(mxY, 1e-4f), 0.0f, 1.0f));
+        float wLobe = -amp / mix(8.0f, 4.5f, clamp(casStrength, 0.0f, 1.0f));
+        y = clamp((y + (yN + yS + yW + yEa) * wLobe) / (1.0f + 4.0f * wLobe), mnY, mxY);
+    }
+
+    float2 uvRaw = uvTex.sample(chromaSampler, uvCoord).rg;
+    float cb, cr;
+    if (fullRange != 0u) {
+        cb = uvRaw.x - (128.0f / 255.0f);
+        cr = uvRaw.y - (128.0f / 255.0f);
+    } else {
+        cb = uvRaw.x * (255.0f / 224.0f) - (128.0f / 224.0f);
+        cr = uvRaw.y * (255.0f / 224.0f) - (128.0f / 224.0f);
+    }
+
+    // ITU-R BT.709 YCbCr -> RGB
+    float3 rgb;
+    rgb.r = y + 1.5748f * cr;
+    rgb.g = y - 0.187324f * cb - 0.468124f * cr;
+    rgb.b = y + 1.8556f * cb;
+    rgb = clamp(rgb, 0.0f, 1.0f);
+    outBGRA.write(half4(half3(rgb), 1.0h), gid);
 }

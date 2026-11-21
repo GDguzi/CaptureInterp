@@ -1,6 +1,33 @@
 import Foundation
 import Metal
 
+/// Relocatable resource bundle lookup that works inside standalone .app bundles (Contents/Resources/),
+/// next to CLI binaries (.build/release/), or anywhere on another user's Mac without baking build-machine paths.
+public enum RifeResourceBundle {
+    private final class Anchor {}
+
+    public static func bundle(named bundleName: String) -> Bundle? {
+        let fullName = bundleName.hasSuffix(".bundle") ? bundleName : "\(bundleName).bundle"
+        var candidates: [URL?] = [
+            Bundle.main.resourceURL?.appendingPathComponent(fullName),
+            Bundle.main.bundleURL.appendingPathComponent(fullName),
+            Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(fullName),
+            Bundle.main.executableURL?.resolvingSymlinksInPath().deletingLastPathComponent().appendingPathComponent(fullName),
+            Bundle(for: Anchor.self).resourceURL?.appendingPathComponent(fullName),
+        ]
+        // Also support running from Contents/MacOS/<exec> -> ../Resources/<fullName>
+        if let execDir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            candidates.append(execDir.deletingLastPathComponent().appendingPathComponent("Resources").appendingPathComponent(fullName))
+        }
+        for case let url? in candidates {
+            if let b = Bundle(url: url) {
+                return b
+            }
+        }
+        return nil
+    }
+}
+
 public enum BackwardWarpError: Error {
     case shaderNotFound
     case pipelineCompilationFailed(String)
@@ -14,9 +41,12 @@ public final class BackwardWarpKernel {
     public let bufferPipeline: MTLComputePipelineState
 
     public init(device: MTLDevice) throws {
+        guard let resBundle = RifeResourceBundle.bundle(named: "RifeMetal_RifeMetalCore") else {
+            throw BackwardWarpError.pipelineCompilationFailed("RifeMetal_RifeMetalCore.bundle not found in app resources")
+        }
         let library: MTLLibrary
         do {
-            library = try device.makeDefaultLibrary(bundle: Bundle.module)
+            library = try device.makeDefaultLibrary(bundle: resBundle)
         } catch {
             throw BackwardWarpError.pipelineCompilationFailed("library load failed: \(error)")
         }
@@ -99,6 +129,7 @@ public final class ConversionKernels {
     /// Fused blend + sigmoid + RGB→BGRA pack (full res, replaces blendExecutable+rgbToBGRA pair).
     public let blendAndPack: MTLComputePipelineState
     public let blendUpsampleMaskAndPackCropped: MTLComputePipelineState
+    public let edgeGuidedWarpBlendCropped: MTLComputePipelineState
     /// Fused bilinear upsample + flow split (balanced tier final flow).
     public let flowUpsampleSplit: MTLComputePipelineState
     /// Fused mask-upsample + blend + RGB→BGRA pack (balanced tier final blend).
@@ -107,11 +138,16 @@ public final class ConversionKernels {
     public let rgba4BufToRGBATex: MTLComputePipelineState
     /// Pack an RGBA16Float texture → fp16 4-channel buffer (v4.25 warped feature tex→buf).
     public let rgbaTexTo4ChBuf: MTLComputePipelineState
+    /// Zero-copy NV12 (420v/420f) → BGRA8 conversion inside RIFE's own command buffer.
+    public let nv12ToBGRA: MTLComputePipelineState
 
     public init(device: MTLDevice) throws {
+        guard let resBundle = RifeResourceBundle.bundle(named: "RifeMetal_RifeMetalCore") else {
+            throw BackwardWarpError.pipelineCompilationFailed("RifeMetal_RifeMetalCore.bundle not found in app resources")
+        }
         let library: MTLLibrary
         do {
-            library = try device.makeDefaultLibrary(bundle: Bundle.module)
+            library = try device.makeDefaultLibrary(bundle: resBundle)
         } catch {
             throw BackwardWarpError.pipelineCompilationFailed("library load failed: \(error)")
         }
@@ -139,10 +175,14 @@ public final class ConversionKernels {
         self.rgbaTexToRGBBuf = try device.makeComputePipelineState(function: f5)
         self.bgraDownsampleToRGB = try device.makeComputePipelineState(function: f6)
         self.blendAndPack = try device.makeComputePipelineState(function: f7)
-        guard let croppedMask = library.makeFunction(name: "rifeBlendUpsampleMaskAndPackCropped") else {
+        guard let croppedMask = library.makeFunction(name: "rifeBlendUpsampleMaskAndPackCropped"),
+              let edgeGuided = library.makeFunction(name: "rifeEdgeGuidedWarpBlendCropped"),
+              let nv12Fn = library.makeFunction(name: "rifeNV12ToBGRA") else {
             throw BackwardWarpError.shaderNotFound
         }
         self.blendUpsampleMaskAndPackCropped = try device.makeComputePipelineState(function: croppedMask)
+        self.edgeGuidedWarpBlendCropped = try device.makeComputePipelineState(function: edgeGuided)
+        self.nv12ToBGRA = try device.makeComputePipelineState(function: nv12Fn)
         self.flowUpsampleSplit = try device.makeComputePipelineState(function: f8)
         self.blendUpsampleMaskAndPack = try device.makeComputePipelineState(function: f9)
         self.rgba4BufToRGBATex = try device.makeComputePipelineState(function: f10)

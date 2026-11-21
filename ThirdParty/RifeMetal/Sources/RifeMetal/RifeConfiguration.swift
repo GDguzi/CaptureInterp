@@ -14,14 +14,16 @@ public typealias RifeExperimentOptions = RifeMetalCore.RifeExperimentOptions
 /// targeting 4K 30fps real-time throughput.
 public enum RifeQualityTier: String, Sendable, CaseIterable {
     case hq         // internal scale 1.0 (full-res inference)
-    case balanced   // internal scale 0.5 (UHD mode)
-    case fast       // internal scale 0.25 (1/4 res; ~16x fewer IFNet pixels vs hq)
+    case balanced   // internal scale 0.5 (UHD mode: 1920x1088 at 4K)
+    case medium     // internal scale 1/3 ("4.5 tier": 1280x768 at 4K, full 4K warp+blend, fits <15ms budget)
+    case fast       // internal scale 0.25 (1/4 res: 960x576 at 4K)
 
     /// Ratio of internal IFNet resolution to padded full resolution.
     public var internalScale: Double {
         switch self {
         case .hq:       return 1.0
         case .balanced: return 0.5
+        case .medium:   return 1.0 / 3.0
         case .fast:     return 0.25
         }
     }
@@ -33,6 +35,7 @@ public enum RifeQualityTier: String, Sendable, CaseIterable {
         switch self {
         case .hq:       return 64
         case .balanced: return 128
+        case .medium:   return 192
         case .fast:     return 256
         }
     }
@@ -57,11 +60,18 @@ public struct RifeConfiguration: Sendable {
 
 public extension RifeConfiguration {
 
-    /// File URL of the rife-v4.25 model weights bundled inside this Swift package.
-    /// Resolved via SwiftPM's per-target `Bundle.module`. Force-unwrap is safe — if
-    /// the resource is missing, the package itself is malformed.
-    static let bundledModelURL: URL = Bundle.module.url(forResource: "rife-v4.25",
-                                                          withExtension: "rmw")!
+    /// File URL of the rife-v4.25 model weights bundled inside RifeMetal_RifeMetal.bundle.
+    /// Looked up dynamically from Contents/Resources or next to the executable so relocated .app bundles work anywhere.
+    static let bundledModelURL: URL = {
+        if let b = RifeResourceBundle.bundle(named: "RifeMetal_RifeMetal"),
+           let url = b.url(forResource: "rife-v4.25", withExtension: "rmw") {
+            return url
+        }
+        if let url = Bundle.main.url(forResource: "rife-v4.25", withExtension: "rmw") {
+            return url
+        }
+        fatalError("RifeMetal_RifeMetal.bundle/rife-v4.25.rmw missing from application resources")
+    }()
 
     /// Configuration that uses the package's bundled rife-v4.25 weights. Most callers
     /// want this — no need to source weights separately.
